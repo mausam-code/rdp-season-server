@@ -1,133 +1,336 @@
-name: win 11 + tailscale + Download.bat script 
+name: JK SYSTEM OCR - Temporary Windows RDP
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: jk-ocr-rdp
+  cancel-in-progress: false
+
 jobs:
-  secure-rdp:
+  ocr-testing:
     runs-on: windows-2022
     timeout-minutes: 350
 
+    defaults:
+      run:
+        shell: pwsh
+
     steps:
-      - name: Configure Core RDP Settings
+      - name: Validate required secrets
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_CLIENT_IP: ${{ secrets.RDP_CLIENT_IP }}
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          $ErrorActionPreference = "Stop"
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Fixed Password
-        run: |
-          $password = "MR.English2008"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Add the TS_AUTHKEY repository secret."
           }
 
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-         
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection + Watch RDP User
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-
-          $rdpProfile = "C:\Users\RDP"
-          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
-
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "✅ Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "✅ Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
-              }
+          if ($env:RDP_PASSWORD.Length -lt 16) {
+            throw "RDP_PASSWORD must contain at least 16 characters."
           }
 
-          # Keep runner alive
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          $parsed = $null
+          if (-not [System.Net.IPAddress]::TryParse(
+            $env:RDP_CLIENT_IP, [ref]$parsed
+          )) {
+            throw "RDP_CLIENT_IP must be your computer's Tailscale IPv4."
+          }
+
+          $bytes = $parsed.GetAddressBytes()
+          if (
+            $bytes.Length -ne 4 -or
+            $bytes[0] -ne 100 -or
+            $bytes[1] -lt 64 -or
+            $bytes[1] -gt 127
+          ) {
+            throw "RDP_CLIENT_IP must be within 100.64.0.0/10."
+          }
+
+      - name: Check out JK SYSTEM
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Tailscale and Tesseract
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install tailscale tesseract --yes --no-progress
+          if ($LASTEXITCODE -notin @(0, 1641, 3010)) {
+            throw "Software installation failed: $LASTEXITCODE"
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ocr = "$env:ProgramFiles\Tesseract-OCR\tesseract.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
+          if (-not (Test-Path $ocr)) {
+            throw "Tesseract executable not found."
+          }
+
+          "$env:ProgramFiles\Tailscale" >> $env:GITHUB_PATH
+          "$env:ProgramFiles\Tesseract-OCR" >> $env:GITHUB_PATH
+          "TESSERACT_CMD=$ocr" >> $env:GITHUB_ENV
+
+          & $ocr --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tesseract verification failed."
+          }
+
+      - name: Connect to Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Start-Service Tailscale
+
+          # Read the key from a temporary file instead of command-line text.
+          $keyFile = Join-Path $env:RUNNER_TEMP "tailscale-auth.txt"
+          [IO.File]::WriteAllText($keyFile, $env:TS_AUTHKEY)
+
+          try {
+            & $ts up `
+              "--auth-key=file:$keyFile" `
+              "--hostname=jk-ocr-$env:GITHUB_RUN_ID" `
+              --unattended=true `
+              --accept-routes=false `
+              --accept-dns=false `
+              --timeout=120s
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed."
+            }
+          }
+          finally {
+            Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+          }
+
+          $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) {
+            throw "No Tailscale IPv4 address was assigned."
+          }
+
+          "RDP_SERVER_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Create one administrator RDP login
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_CLIENT_IP: ${{ secrets.RDP_CLIENT_IP }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "jkocr"
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = New-LocalUser `
+            -Name $username `
+            -Password $password `
+            -FullName "JK OCR Tester" `
+            -Description "Temporary JK SYSTEM OCR testing account" `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          $admins = Get-LocalGroup -SID "S-1-5-32-544"
+          Add-LocalGroupMember -Group $admins -Member $username
+
+          # Only this account receives the RDP logon right.
+          # Preserve unrelated local security settings.
+          $cfg = Join-Path $env:RUNNER_TEMP "rdp-security.inf"
+          $db = Join-Path $env:RUNNER_TEMP "rdp-security.sdb"
+
+          secedit.exe /export /cfg $cfg /areas USER_RIGHTS /quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not export local security policy."
+          }
+
+          $text = Get-Content $cfg -Raw
+          $entry = "SeRemoteInteractiveLogonRight = *$($user.SID.Value)"
+
+          if ($text -match '(?m)^SeRemoteInteractiveLogonRight\s*=.*$') {
+            $text = [regex]::Replace(
+              $text,
+              '(?m)^SeRemoteInteractiveLogonRight\s*=.*$',
+              $entry
+            )
+          }
+          else {
+            $text = $text.Replace(
+              "[Privilege Rights]",
+              "[Privilege Rights]`r`n$entry"
+            )
+          }
+
+          Set-Content $cfg -Value $text -Encoding Unicode
+          secedit.exe /configure /db $db /cfg $cfg /areas USER_RIGHTS /quiet
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not apply the single-user RDP policy."
+          }
+
+          $terminal = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $rdp = "$terminal\WinStations\RDP-Tcp"
+
+          Set-ItemProperty $terminal -Name fDenyTSConnections -Value 0
+
+          # Keep Network Level Authentication enabled.
+          Set-ItemProperty $rdp -Name UserAuthentication -Value 1
+          Set-ItemProperty $rdp -Name SecurityLayer -Value 2
+
+          $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item $policy -Force | Out-Null
+          New-ItemProperty $policy `
+            -Name fSingleSessionPerUser -Value 1 `
+            -PropertyType DWord -Force | Out-Null
+          New-ItemProperty $policy `
+            -Name MaxInstanceCount -Value 1 `
+            -PropertyType DWord -Force | Out-Null
+
+          # Disable built-in broad RDP rules.
+          Get-NetFirewallRule -Name "RemoteDesktop*" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Only your Tailscale device can reach the RDP listener.
+          New-NetFirewallRule `
+            -DisplayName "JK OCR - RDP from my Tailscale device" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -LocalAddress $env:RDP_SERVER_IP `
+            -RemoteAddress $env:RDP_CLIENT_IP `
+            -Profile Any | Out-Null
+
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+
+      - name: Prepare OCR workspace
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $venv = Join-Path $workspace ".venv"
+
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) {
+            throw "Virtual environment creation failed."
+          }
+
+          $python = Join-Path $venv "Scripts\python.exe"
+
+          & $python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) {
+            throw "pip update failed."
+          }
+
+          & $python -m pip install pillow pytesseract opencv-python numpy
+          if ($LASTEXITCODE -ne 0) {
+            throw "OCR dependency installation failed."
+          }
+
+          $desktop = "C:\Users\Public\Desktop"
+          New-Item $desktop -ItemType Directory -Force | Out-Null
+
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut(
+            "$desktop\JK SYSTEM Workspace.lnk"
+          )
+          $shortcut.TargetPath = $workspace
+          $shortcut.Save()
+
+          @"
+          JK SYSTEM OCR testing
+
+          Repository:
+          $workspace
+
+          Python environment:
+          $venv
+
+          Activate in PowerShell:
+          & "$venv\Scripts\Activate.ps1"
+
+          Tesseract:
+          $env:TESSERACT_CMD
+
+          OCR libraries are installed.
+          Django project requirements, database configuration and frontend
+          dependencies must be configured for your project's current code.
+
+          Save your work before the workflow ends.
+          This entire VM is temporary.
+          "@ | Set-Content "$desktop\JK OCR - Read Me.txt"
+
+      - name: Show connection details
+        run: |
+          $user = "$env:COMPUTERNAME\jkocr"
+
+          @"
+          ## JK SYSTEM OCR session is ready
+
+          | Setting | Value |
+          |---|---|
+          | RDP address | $env:RDP_SERVER_IP |
+          | Username | $user |
+          | Password | Your RDP_PASSWORD repository secret |
+          | Workspace | $env:GITHUB_WORKSPACE |
+          | Testing window | Up to 5 hours after setup |
+
+          On your computer, connect Tailscale, open Remote Desktop
+          Connection (mstsc), and enter the address above.
+
+          Cancel this workflow when finished.
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+          Write-Host "RDP address: $env:RDP_SERVER_IP"
+          Write-Host "Username: $user"
+          Write-Host "Password: use your RDP_PASSWORD secret"
+
+      - name: Keep OCR testing session available
+        run: |
+          $end = (Get-Date).AddHours(5)
+
+          while ((Get-Date) -lt $end) {
+            $remaining = [math]::Ceiling(
+              ($end - (Get-Date)).TotalMinutes
+            )
+            Write-Host "OCR testing session: $remaining minutes remaining."
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Disconnect and close RDP
+        if: always()
+        run: |
+          Set-ItemProperty `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 1 `
+            -ErrorAction SilentlyContinue
+
+          Disable-LocalUser -Name "jkocr" `
+            -ErrorAction SilentlyContinue
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout
           }
